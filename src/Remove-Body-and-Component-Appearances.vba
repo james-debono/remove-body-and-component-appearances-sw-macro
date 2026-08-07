@@ -15,7 +15,7 @@
 '
 ' To use, open a part or assembly document and run the macro.
 '
-'   Version   0.1.0
+'   Version   0.2.0
 '   Date      2026-08-07
 '   Author    James Debono
 '==============================================================================
@@ -26,25 +26,30 @@ Option Explicit
 '
 ' There are no user settings.
 '
+' Removal works through the render material API, not RemoveMaterialProperty.
+' That matters: IBody2::RemoveMaterialProperty is scoped by *configuration*, and
+' since several display states live under one configuration, 0.1.0 used it and
+' wiped the colour out of every display state at once. GetRenderMaterials2 and
+' AddDisplayStateSpecificRenderMaterial take a swDisplayStateOpts_e instead, so
+' they can be pointed at the active display state alone.
+'
+' An appearance is a render material plus the list of entities it is attached to.
+' There is no call to detach one entity, so the sequence is: read the entity
+' list, drop all of them, add back the ones being kept, and write the result to
+' this display state. An appearance left with no entities is gone.
+'
+' EditRebuild3 at the end is not optional. Without it the viewport keeps drawing
+' the old colours until the display state is switched away and back, which reads
+' as the macro having done nothing.
+'
 ' Nothing here may touch a referenced part file. In an assembly that means
-' component-level removal only: IComponent2::RemoveMaterialProperty clears the
-' override the assembly holds, never the part itself. Do not extend the assembly
-' path to bodies or faces - that would edit every part file in the model,
-' including ones other assemblies share, and dirty documents the user never
-' opened.
-'
-' Removal is scoped with swInConfigurationOpts_e.swThisConfiguration. Display
-' states are held against configurations, so this reaches the active display
-' state, but that is an inference rather than a documented guarantee. It is worth
-' re-testing after a SOLIDWORKS upgrade: colour two display states, clear one,
-' and confirm the other still holds its colours.
-'
-' Turning SHOW_DIAGNOSTICS on reports how many entities were cleared against how
-' many were tried, and names any that refused. A gap between the two is the first
-' sign that an API is behaving differently to what is assumed above.
+' component entities only: those are held by the assembly. Do not extend this to
+' faces or bodies in an assembly - those belong to the part documents, and
+' editing them would dirty files the user never opened, including ones shared
+' with other assemblies.
 Const SHOW_DIAGNOSTICS As Boolean = False
 
-Const MACRO_VERSION As String = "0.1.0"
+Const MACRO_VERSION As String = "0.2.0"
 
 Dim swApp As SldWorks.SldWorks
 
@@ -67,15 +72,14 @@ Sub main()
     docType = swModel.GetType()
 
     If docType = swDocumentTypes_e.swDocPART Then
-        ClearPartBodies swModel
+        StripAppearances swModel, False
     ElseIf docType = swDocumentTypes_e.swDocASSEMBLY Then
-        ClearAssemblyComponents swModel
+        StripAppearances swModel, True
     Else
         MsgBox "This macro only works on part or assembly documents.", vbCritical
         Exit Sub
     End If
 
-    swModel.GraphicsRedraw2
     Exit Sub
 
 mainError:
@@ -83,137 +87,120 @@ mainError:
            " (Error " & Err.Number & ")", vbCritical
 End Sub
 
-'--- Part: body-level appearances ---------------------------------------------
+'--- Core ---------------------------------------------------------------------
 
-Sub ClearPartBodies(swModel As SldWorks.ModelDoc2)
-
-    Dim currentStep As String
-    Dim swView As SldWorks.ModelView
-    On Error GoTo ErrorHandler
-
-    currentStep = "Loading bodies"
-    Dim swPart As SldWorks.PartDoc
-    Set swPart = swModel
-
-    Dim vBodies As Variant
-    vBodies = swPart.GetBodies2(swBodyType_e.swAllBodies, False)
-
-    If IsEmpty(vBodies) Then
-        MsgBox "No bodies found in the active part.", vbInformation
-        Exit Sub
-    End If
-
-    Dim totalBodies As Long
-    totalBodies = UBound(vBodies) + 1
-
-    Set swView = swModel.ActiveView
-    If Not swView Is Nothing Then swView.EnableGraphicsUpdate = False
-
-    currentStep = "Removing body appearances"
-    Dim cleared As Long
-    Dim i As Long
-    Dim swBody As SldWorks.Body2
-
-    cleared = 0
-    For i = 0 To totalBodies - 1
-        Set swBody = vBodies(i)
-
-        On Error Resume Next
-        swBody.RemoveMaterialProperty swInConfigurationOpts_e.swThisConfiguration, Empty
-        If Err.Number = 0 Then
-            cleared = cleared + 1
-        ElseIf SHOW_DIAGNOSTICS Then
-            Debug.Print "refused: " & swBody.Name & "  (" & Err.Description & ")"
-        End If
-        Err.Clear
-        On Error GoTo ErrorHandler
-    Next i
-
-    If Not swView Is Nothing Then swView.EnableGraphicsUpdate = True
-    swModel.GraphicsRedraw2
-
-    Dim msg As String
-    msg = "Removed body appearances from the active display state" & vbCrLf & _
-          "Bodies Cleared: " & cleared & " of " & totalBodies & vbCrLf & vbCrLf & _
-          "Face, feature and part appearances were left alone." & vbCrLf & vbCrLf & _
-          "Macro Version: " & MACRO_VERSION
-
-    MsgBox msg, vbInformation
-    Exit Sub
-
-ErrorHandler:
-    If Not swView Is Nothing Then swView.EnableGraphicsUpdate = True
-    MsgBox "ERROR in ClearPartBodies at step [" & currentStep & "]" & vbCrLf & _
-           "Description: " & Err.Description & vbCrLf & _
-           "Error " & Err.Number, vbCritical
-End Sub
-
-'--- Assembly: component-level appearances only -------------------------------
-
-Sub ClearAssemblyComponents(swModel As SldWorks.ModelDoc2)
+Sub StripAppearances(swModel As SldWorks.ModelDoc2, ByVal isAssembly As Boolean)
 
     Dim currentStep As String
     Dim swView As SldWorks.ModelView
     On Error GoTo ErrorHandler
 
-    currentStep = "Loading components"
-    Dim swAssy As SldWorks.AssemblyDoc
-    Set swAssy = swModel
+    currentStep = "Reading appearances for the active display state"
+    Dim vAppearances As Variant
+    vAppearances = swModel.Extension.GetRenderMaterials2( _
+        swDisplayStateOpts_e.swThisDisplayState, Empty)
 
-    Dim vComps As Variant
-    vComps = swAssy.GetComponents(False)
-
-    If IsEmpty(vComps) Then
-        MsgBox "No components found in the active assembly.", vbInformation
+    If IsEmpty(vAppearances) Then
+        MsgBox "There are no appearances in the active display state.", vbInformation
         Exit Sub
     End If
-
-    Dim totalComps As Long
-    totalComps = UBound(vComps) + 1
 
     Set swView = swModel.ActiveView
     If Not swView Is Nothing Then swView.EnableGraphicsUpdate = False
 
-    ' Component level only. This clears the override the assembly holds against
-    ' each component; the part files themselves are not opened, modified or
-    ' marked dirty.
-    currentStep = "Removing component appearances"
-    Dim cleared As Long
-    Dim refused As Long
-    Dim i As Long
-    Dim swComp As SldWorks.Component2
+    Dim examined As Long, strippedTotal As Long, keptTotal As Long
+    examined = 0: strippedTotal = 0: keptTotal = 0
 
-    cleared = 0
-    refused = 0
-    For i = 0 To totalComps - 1
-        Set swComp = vComps(i)
+    Dim i As Long, j As Long
+    Dim swAppearance As SldWorks.RenderMaterial
+    Dim vEnts As Variant
 
-        On Error Resume Next
-        swComp.RemoveMaterialProperty swInConfigurationOpts_e.swThisConfiguration, Empty
-        If Err.Number = 0 Then
-            cleared = cleared + 1
-        Else
-            refused = refused + 1
-            If SHOW_DIAGNOSTICS Then
-                Debug.Print "refused: " & swComp.Name2 & "  (" & Err.Description & ")"
+    currentStep = "Detaching entities"
+    For i = 0 To UBound(vAppearances)
+        Set swAppearance = vAppearances(i)
+        examined = examined + 1
+
+        vEnts = swAppearance.GetEntities
+        If Not IsEmpty(vEnts) Then
+
+            ' Sort this appearance's entities into those being cleared and those
+            ' that must survive untouched.
+            Dim keep As Collection
+            Set keep = New Collection
+            Dim strippedHere As Long
+            strippedHere = 0
+
+            For j = 0 To UBound(vEnts)
+                If ShouldStrip(vEnts(j), isAssembly) Then
+                    strippedHere = strippedHere + 1
+                Else
+                    keep.Add vEnts(j)
+                End If
+            Next j
+
+            If strippedHere > 0 Then
+                strippedTotal = strippedTotal + strippedHere
+                keptTotal = keptTotal + keep.Count
+
+                If SHOW_DIAGNOSTICS Then
+                    Debug.Print "appearance " & i & ": clearing " & strippedHere & _
+                                ", keeping " & keep.Count
+                End If
+
+                ' No API detaches a single entity, so drop the lot and put back
+                ' the survivors.
+                swAppearance.RemoveAllEntities
+
+                Dim k As Long
+                For k = 1 To keep.Count
+                    If swAppearance.AddEntity(keep(k)) = False Then
+                        If SHOW_DIAGNOSTICS Then
+                            Debug.Print "   failed to re-attach entity " & k
+                        End If
+                    End If
+                Next k
+
+                ' Written back against this display state only. An appearance
+                ' with nothing left attached simply ceases to exist.
+                If keep.Count > 0 Then
+                    Dim matId1 As Long, matId2 As Long
+                    swAppearance.GetMaterialIds matId1, matId2
+                    If swModel.Extension.AddDisplayStateSpecificRenderMaterial( _
+                        swAppearance, swDisplayStateOpts_e.swThisDisplayState, _
+                        Empty, matId1, matId2) = False Then
+                        If SHOW_DIAGNOSTICS Then
+                            Debug.Print "   failed to write appearance " & i & " back"
+                        End If
+                    End If
+                End If
             End If
         End If
-        Err.Clear
-        On Error GoTo ErrorHandler
     Next i
 
     If Not swView Is Nothing Then swView.EnableGraphicsUpdate = True
-    swModel.GraphicsRedraw2
+
+    ' Required. Without it the viewport keeps showing the old colours until the
+    ' display state is switched away and back.
+    currentStep = "Rebuilding"
+    swModel.EditRebuild3
 
     Dim msg As String
-    msg = "Removed component appearances from the active display state" & vbCrLf & _
-          "Components Cleared: " & cleared & " of " & totalComps & vbCrLf & vbCrLf & _
-          "The referenced part files were not modified." & vbCrLf & vbCrLf & _
-          "Macro Version: " & MACRO_VERSION
+    If isAssembly Then
+        msg = "Removed component appearances from the active display state" & vbCrLf & _
+              "Components Cleared: " & strippedTotal & vbCrLf & vbCrLf & _
+              "The referenced part files were not modified."
+    Else
+        msg = "Removed body appearances from the active display state" & vbCrLf & _
+              "Bodies Cleared: " & strippedTotal & vbCrLf & vbCrLf & _
+              "Face, feature and part appearances were left alone."
+    End If
 
-    If refused > 0 And SHOW_DIAGNOSTICS Then
-        msg = msg & vbCrLf & vbCrLf & "Refused: " & refused & _
-              " - see the Immediate window (Ctrl+G)"
+    msg = msg & vbCrLf & vbCrLf & "Macro Version: " & MACRO_VERSION
+
+    If SHOW_DIAGNOSTICS Then
+        msg = msg & vbCrLf & vbCrLf & _
+              "Appearances examined: " & examined & vbCrLf & _
+              "Entities kept: " & keptTotal
     End If
 
     MsgBox msg, vbInformation
@@ -221,7 +208,27 @@ Sub ClearAssemblyComponents(swModel As SldWorks.ModelDoc2)
 
 ErrorHandler:
     If Not swView Is Nothing Then swView.EnableGraphicsUpdate = True
-    MsgBox "ERROR in ClearAssemblyComponents at step [" & currentStep & "]" & vbCrLf & _
+    MsgBox "ERROR in StripAppearances at step [" & currentStep & "]" & vbCrLf & _
            "Description: " & Err.Description & vbCrLf & _
            "Error " & Err.Number, vbCritical
 End Sub
+
+' Which entities this macro is responsible for clearing.
+'
+' A part's appearances may be attached to faces, features, bodies or the part
+' itself; only bodies are ours. An assembly's may be attached to components or
+' to the assembly document; only components are ours, and those are the only
+' ones the assembly owns rather than the part files it references.
+Function ShouldStrip(ByVal ent As Object, ByVal isAssembly As Boolean) As Boolean
+    On Error GoTo NotOurs
+
+    If isAssembly Then
+        ShouldStrip = (TypeOf ent Is SldWorks.Component2)
+    Else
+        ShouldStrip = (TypeOf ent Is SldWorks.Body2)
+    End If
+    Exit Function
+
+NotOurs:
+    ShouldStrip = False
+End Function
