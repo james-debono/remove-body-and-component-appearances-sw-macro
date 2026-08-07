@@ -3,8 +3,9 @@
 '
 ' Clears the appearances that Apply Unique Colours writes, and nothing else.
 '
-' In a part, appearances applied at body level are removed. Colours applied to
-' individual faces, to features, or to the part as a whole are left alone.
+' In a part, appearances applied at body level are removed, along with the faces
+' that were only carrying the body's colour. A colour applied to a face on its
+' own is left alone.
 '
 ' In an assembly, the component-level appearances held by the assembly are
 ' removed. The part files the assembly references are never modified - whatever
@@ -15,7 +16,7 @@
 '
 ' To use, open a part or assembly document and run the macro.
 '
-'   Version   0.3.0
+'   Version   0.4.0
 '   Date      2026-08-07
 '   Author    James Debono
 '==============================================================================
@@ -38,22 +39,27 @@ Option Explicit
 ' list, drop all of them, add back the ones being kept, and write the result to
 ' this display state. An appearance left with no entities is gone.
 '
-' EditRebuild3 at the end is not optional. Without it the viewport keeps drawing
-' the old colours until the display state is switched away and back, which reads
-' as the macro having done nothing.
+' A body's appearance is listed against the body AND against every face that
+' inherits it. Those faces have to go with the body. 0.3.0 kept them - on a
+' 56 body weldment that meant putting back 5,359 faces one AddEntity call at a
+' time, which took 161 seconds and left every affected body still coloured
+' through its own faces. A face the user coloured deliberately sits in its own
+' appearance, so it never shares an entity list with a body being stripped and
+' is never touched by this rule.
 '
 ' Nothing here may touch a referenced part file. In an assembly that means
 ' component entities only: those are held by the assembly. Do not extend this to
 ' faces or bodies in an assembly - those belong to the part documents, and
 ' editing them would dirty files the user never opened, including ones shared
 ' with other assemblies.
+'
 ' On while this macro is still being proven. It writes one line per appearance to
 ' the VBA Immediate window (Ctrl+G in the editor) giving what that appearance was
 ' attached to, what was cleared, what was kept, and whether writing it back
-' succeeded - plus a timing breakdown separating the strip from the rebuild.
+' succeeded - plus a timing breakdown.
 Const SHOW_DIAGNOSTICS As Boolean = True
 
-Const MACRO_VERSION As String = "0.3.0"
+Const MACRO_VERSION As String = "0.4.0"
 
 Dim swApp As SldWorks.SldWorks
 
@@ -118,9 +124,10 @@ Sub StripAppearances(swModel As SldWorks.ModelDoc2, ByVal isAssembly As Boolean)
     If Not swView Is Nothing Then swView.EnableGraphicsUpdate = False
 
     Dim examined As Long, strippedTotal As Long, keptTotal As Long
+    Dim facesFollowed As Long
     Dim emptied As Long, partial As Long, untouched As Long
     Dim reattachFails As Long, writeBackFails As Long
-    examined = 0: strippedTotal = 0: keptTotal = 0
+    examined = 0: strippedTotal = 0: keptTotal = 0: facesFollowed = 0
     emptied = 0: partial = 0: untouched = 0
     reattachFails = 0: writeBackFails = 0
 
@@ -146,8 +153,25 @@ Sub StripAppearances(swModel As SldWorks.ModelDoc2, ByVal isAssembly As Boolean)
 
         If Not IsEmpty(vEnts) Then
 
-            ' Sort this appearance's entities into those being cleared and those
-            ' that must survive untouched.
+            ' First pass: which bodies is this appearance losing? Needed before
+            ' the faces can be judged, since a face is only dropped when the body
+            ' it belongs to is being dropped from this same appearance.
+            Dim losing As Object
+            Set losing = CreateObject("Scripting.Dictionary")
+
+            If Not isAssembly Then
+                For j = 0 To UBound(vEnts)
+                    If TypeOf vEnts(j) Is SldWorks.Body2 Then
+                        Dim swOwnedBody As SldWorks.Body2
+                        Set swOwnedBody = vEnts(j)
+                        If Not losing.Exists(swOwnedBody.Name) Then
+                            losing.Add swOwnedBody.Name, True
+                        End If
+                    End If
+                Next j
+            End If
+
+            ' Second pass: sort the entities into those going and those staying.
             Dim keep As Collection
             Set keep = New Collection
             Dim strippedHere As Long
@@ -156,6 +180,9 @@ Sub StripAppearances(swModel As SldWorks.ModelDoc2, ByVal isAssembly As Boolean)
             For j = 0 To UBound(vEnts)
                 If ShouldStrip(vEnts(j), isAssembly) Then
                     strippedHere = strippedHere + 1
+                ElseIf FaceBelongsToStrippedBody(vEnts(j), losing, isAssembly) Then
+                    strippedHere = strippedHere + 1
+                    facesFollowed = facesFollowed + 1
                 Else
                     keep.Add vEnts(j)
                 End If
@@ -215,8 +242,6 @@ Sub StripAppearances(swModel As SldWorks.ModelDoc2, ByVal isAssembly As Boolean)
 
     If Not swView Is Nothing Then swView.EnableGraphicsUpdate = True
 
-    ' Timed separately: this is a full model rebuild, and on a part with a large
-    ' feature tree it is likely to dominate the run.
     currentStep = "Rebuilding"
     swModel.EditRebuild3
     tRefreshed = Timer
@@ -228,7 +253,7 @@ Sub StripAppearances(swModel As SldWorks.ModelDoc2, ByVal isAssembly As Boolean)
               "The referenced part files were not modified."
     Else
         msg = "Removed body appearances from the active display state" & vbCrLf & _
-              "Bodies Cleared: " & strippedTotal & vbCrLf & vbCrLf & _
+              "Bodies Cleared: " & (strippedTotal - facesFollowed) & vbCrLf & vbCrLf & _
               "Face, feature and part appearances were left alone."
     End If
 
@@ -240,6 +265,7 @@ Sub StripAppearances(swModel As SldWorks.ModelDoc2, ByVal isAssembly As Boolean)
               "  emptied completely: " & emptied & vbCrLf & _
               "  partly kept: " & partial & vbCrLf & _
               "  left alone: " & untouched & vbCrLf & _
+              "Faces dropped with their body: " & facesFollowed & vbCrLf & _
               "Entities kept: " & keptTotal & vbCrLf & _
               "Re-attach failures: " & reattachFails & vbCrLf & _
               "Write-back failures: " & writeBackFails & vbCrLf & vbCrLf & _
@@ -250,6 +276,8 @@ Sub StripAppearances(swModel As SldWorks.ModelDoc2, ByVal isAssembly As Boolean)
 
         Debug.Print "emptied=" & emptied & "  partial=" & partial & _
                     "  untouched=" & untouched & _
+                    "  facesFollowed=" & facesFollowed & _
+                    "  kept=" & keptTotal & _
                     "  reattachFails=" & reattachFails & _
                     "  writeBackFails=" & writeBackFails
         Debug.Print "=== end ==="
@@ -285,9 +313,38 @@ NotOurs:
     ShouldStrip = False
 End Function
 
+' True when this entity is a face that is only carrying the colour of a body
+' being cleared from the same appearance.
+'
+' Removing the body alone is not enough: the colour stays visible through the
+' faces, because a face-level appearance wins over a body-level one. A face the
+' user coloured deliberately belongs to a different appearance and so is never
+' in this entity list to begin with.
+Function FaceBelongsToStrippedBody(ByVal ent As Object, ByVal losing As Object, _
+                                   ByVal isAssembly As Boolean) As Boolean
+    On Error GoTo NotOurs
+
+    FaceBelongsToStrippedBody = False
+    If isAssembly Then Exit Function
+    If losing Is Nothing Then Exit Function
+    If losing.Count = 0 Then Exit Function
+    If Not (TypeOf ent Is SldWorks.Face2) Then Exit Function
+
+    Dim swFace As SldWorks.Face2
+    Set swFace = ent
+
+    Dim swOwner As SldWorks.Body2
+    Set swOwner = swFace.GetBody()
+    If swOwner Is Nothing Then Exit Function
+
+    FaceBelongsToStrippedBody = losing.Exists(swOwner.Name)
+    Exit Function
+
+NotOurs:
+    FaceBelongsToStrippedBody = False
+End Function
+
 ' A readable summary of what an appearance is attached to, for diagnostics.
-' Which entity kinds an appearance actually carries is the thing that decides
-' whether it gets emptied, partly kept, or left alone.
 Function DescribeEntities(ByVal vEnts As Variant) As String
     On Error GoTo Failed
 
