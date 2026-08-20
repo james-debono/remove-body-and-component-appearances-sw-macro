@@ -16,15 +16,16 @@
 '
 ' To use, open a part or assembly document and run the macro.
 '
-'   Version   0.5.2
-'   Date      2026-08-13
+'   Version   0.5.3
+'   Date      2026-08-20
 '   Author    James Debono
 '   Licence   MIT - full text below
-'   Source    https://github.com/james-debono/solidworks-apply-colours
+'   Source    https://github.com/james-debono/apply-colours-sw-macro
 '
 '------------------------------------------------------------------------------
 ' CHANGELOG (summary - see CHANGELOG.md for the full history)
 '
+'   0.5.3   Source URL updated for the repository rename.
 '   0.5.2   Version reported on completion corrected.
 '   0.5.1   Licence and header.
 '   0.5.0   An appearance touching a body is cleared whole, faces included.
@@ -105,7 +106,7 @@ Const SHOW_DIAGNOSTICS As Boolean = False
 
 ' Must match the Version line in the header block above. build-library.ps1 checks
 ' that they agree and fails the build if they drift.
-Const MACRO_VERSION As String = "0.5.2"
+Const MACRO_VERSION As String = "0.5.3"
 
 Dim swApp As SldWorks.SldWorks
 
